@@ -975,3 +975,13 @@ def test53_issue_930():
     import numpy as np
     wrapper = t.Wrapper(np.ones(3, dtype=np.float32))
     assert wrapper.value[0] == 1
+
+
+def test54_memoryview_metadata():
+    import array
+    arr = array.array('i', [1, 2, 3])
+    mview = memoryview(arr)
+    assert t.get_size(mview) == 3
+    casted_mview = mview.cast('B', shape=[3, 4])
+    assert t.get_shape(casted_mview) == [3, 4]
+    assert t.get_itemsize(casted_mview) == 1

@@ -215,18 +215,9 @@ static PyTypeObject *nd_ndarray_tp() noexcept {
     return tp;
 }
 
-static PyObject *dlpack_from_buffer_protocol(PyObject *o, bool ro) {
-    scoped_pymalloc<Py_buffer> view;
-    scoped_pymalloc<managed_dltensor> mt;
-
-    if (PyObject_GetBuffer(o, view.get(),
-                           ro ? PyBUF_RECORDS_RO : PyBUF_RECORDS)) {
-        PyErr_Clear();
-        return nullptr;
-    }
-
+static bool dtype_from_buffer(dlpack::dtype& dt, Py_buffer& buffer) {
     char format_c = 'B';
-    const char *format_str = view->format;
+    const char *format_str = buffer.format;
     if (format_str)
         format_c = *format_str;
 
@@ -248,7 +239,6 @@ static PyObject *dlpack_from_buffer_protocol(PyObject *o, bool ro) {
     if (is_complex)
         format_c = *++format_str;
 
-    dlpack::dtype dt { };
     bool fail = format_str && format_str[1] != '\0';
 
     if (!fail) {
@@ -284,10 +274,59 @@ static PyObject *dlpack_from_buffer_protocol(PyObject *o, bool ro) {
         }
 
         dt.lanes = 1;
-        dt.bits = (uint8_t) (view->itemsize * 8);
+        dt.bits = (uint8_t) (buffer.itemsize * 8);
     }
 
-    if (fail) {
+    return !fail;
+}
+
+static bool dltensor_from_buffer(managed_dltensor &mt, Py_buffer &view, dlpack::dtype dt) {
+    /* DLPack mandates 256-byte alignment of the 'DLTensor::data' field, but
+       PyTorch unfortunately ignores the 'byte_offset' value.. :-( */
+#if 0
+    uintptr_t value_int = (uintptr_t) view->buf,
+              value_rounded = (value_int / 256) * 256;
+#else
+    uintptr_t value_int = (uintptr_t) view.buf,
+              value_rounded = value_int;
+#endif
+
+    mt.dltensor.data = (void *) value_rounded;
+    mt.dltensor.device = { device::cpu::value, 0 };
+    mt.dltensor.ndim = view.ndim;
+    mt.dltensor.dtype = dt;
+    mt.dltensor.byte_offset = value_int - value_rounded;
+
+    scoped_pymalloc<int64_t> strides((size_t) view.ndim);
+    scoped_pymalloc<int64_t> shape((size_t) view.ndim);
+    const int64_t itemsize = static_cast<int64_t>(view.itemsize);
+    for (size_t i = 0; i < (size_t) view.ndim; ++i) {
+        int64_t stride = view.strides[i] / itemsize;
+        if (stride * itemsize != view.strides[i]) {
+            return false;
+        }
+        strides[i] = stride;
+        shape[i] = (int64_t) view.shape[i];
+    }
+
+    mt.dltensor.shape = shape.release();
+    mt.dltensor.strides = strides.release();
+
+    return true;
+}
+
+static PyObject *dlpack_from_buffer_protocol(PyObject *o, bool ro) {
+    scoped_pymalloc<Py_buffer> view;
+    scoped_pymalloc<managed_dltensor> mt;
+
+    if (PyObject_GetBuffer(o, view.get(),
+                           ro ? PyBUF_RECORDS_RO : PyBUF_RECORDS)) {
+        PyErr_Clear();
+        return nullptr;
+    }
+
+    dlpack::dtype dt { };
+    if (!dtype_from_buffer(dt, *view.get())) {
         PyBuffer_Release(view.get());
         return nullptr;
     }
@@ -302,38 +341,12 @@ static PyObject *dlpack_from_buffer_protocol(PyObject *o, bool ro) {
         PyMem_Free(mt2);
     };
 
-    /* DLPack mandates 256-byte alignment of the 'DLTensor::data' field, but
-       PyTorch unfortunately ignores the 'byte_offset' value.. :-( */
-#if 0
-    uintptr_t value_int = (uintptr_t) view->buf,
-              value_rounded = (value_int / 256) * 256;
-#else
-    uintptr_t value_int = (uintptr_t) view->buf,
-              value_rounded = value_int;
-#endif
-
-    mt->dltensor.data = (void *) value_rounded;
-    mt->dltensor.device = { device::cpu::value, 0 };
-    mt->dltensor.ndim = view->ndim;
-    mt->dltensor.dtype = dt;
-    mt->dltensor.byte_offset = value_int - value_rounded;
-
-    scoped_pymalloc<int64_t> strides((size_t) view->ndim);
-    scoped_pymalloc<int64_t> shape((size_t) view->ndim);
-    const int64_t itemsize = static_cast<int64_t>(view->itemsize);
-    for (size_t i = 0; i < (size_t) view->ndim; ++i) {
-        int64_t stride = view->strides[i] / itemsize;
-        if (stride * itemsize != view->strides[i]) {
-            PyBuffer_Release(view.get());
-            return nullptr;
-        }
-        strides[i] = stride;
-        shape[i] = (int64_t) view->shape[i];
+    if(!dltensor_from_buffer(*mt.get(), *view.get(), dt)) {
+        PyBuffer_Release(view.get());
+        return nullptr;
     }
 
     mt->manager_ctx = view.release();
-    mt->dltensor.shape = shape.release();
-    mt->dltensor.strides = strides.release();
 
     return PyCapsule_New(mt.release(), "dltensor", [](PyObject *o) {
         error_scope scope; // temporarily save any existing errors
@@ -348,8 +361,60 @@ static PyObject *dlpack_from_buffer_protocol(PyObject *o, bool ro) {
     });
 }
 
+#if !defined(Py_LIMITED_API)
+static PyObject *dlpack_from_memoryview(PyObject *o) {
+    scoped_pymalloc<managed_dltensor> mt;
+
+    if (!PyMemoryView_Check(o)) {
+        PyErr_Clear();
+        return nullptr;
+    }
+
+    PyObject* mview = PyMemoryView_FromObject(o);
+    Py_buffer* buffer = PyMemoryView_GET_BUFFER(mview);
+
+    dlpack::dtype dt { };
+    if (!dtype_from_buffer(dt, *buffer)) {
+        Py_DECREF(mview);
+        return nullptr;
+    }
+
+    mt->deleter = [](managed_dltensor *mt2) {
+        gil_scoped_acquire guard;
+        PyObject *mview = (PyObject *) mt2->manager_ctx;
+        Py_DECREF(mview);
+        PyMem_Free(mt2->dltensor.shape);
+        PyMem_Free(mt2->dltensor.strides);
+        PyMem_Free(mt2);
+    };
+
+    if(!dltensor_from_buffer(*mt.get(), *buffer, dt)) {
+        Py_DECREF(mview);
+        return nullptr;
+}
+
+    mt->manager_ctx = mview;
+
+    return PyCapsule_New(mt.release(), "dltensor", [](PyObject *o) {
+        error_scope scope; // temporarily save any existing errors
+        managed_dltensor *mt =
+            (managed_dltensor *) PyCapsule_GetPointer(o, "dltensor");
+        if (mt) {
+            if (mt->deleter)
+                mt->deleter(mt);
+        } else {
+            PyErr_Clear();
+        }
+    });
+}
+#endif // !defined(Py_LIMITED_API)
+
 bool ndarray_check(PyObject *o) noexcept {
-    if (PyObject_HasAttrString(o, "__dlpack__") || PyObject_CheckBuffer(o))
+    if (PyObject_HasAttrString(o, "__dlpack__") || PyObject_CheckBuffer(o)
+#if !defined(Py_LIMITED_API)
+        || PyMemoryView_Check(o)
+#endif
+        )
         return true;
 
     PyTypeObject *tp = Py_TYPE(o);
@@ -410,6 +475,12 @@ ndarray_handle *ndarray_import(PyObject *o, const ndarray_config *c,
         // Try creating an ndarray via the buffer protocol
         if (!capsule.is_valid())
             capsule = steal(dlpack_from_buffer_protocol(o, c->ro));
+
+#if !defined(Py_LIMITED_API)
+        // Try creating an ndarray from memoryview
+        if (!capsule.is_valid())
+            capsule = steal(dlpack_from_memoryview(o));
+#endif
 
         if (!capsule.is_valid())
             return nullptr;
