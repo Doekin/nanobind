@@ -173,6 +173,7 @@ set(TEST_FILES
   test_stubs.py
   test_typing.py
   test_thread.py
+  test_lib_path.py
 
   # Stub reference files
   test_classes_ext.pyi.ref
@@ -223,4 +224,22 @@ nanobind_add_stub(
     ${PYI_PREFIX}py_recursive_stub_test/__init__.pyi
     ${PYI_PREFIX}py_recursive_stub_test/bar.pyi
   PYTHON_PATH ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+# Test for stub generation with LIB_PATH
+add_library(test_lib_path_lib SHARED test_lib_path_lib.cpp)
+if (MSVC)
+    target_compile_definitions(test_lib_path_lib PRIVATE "SHARED_LIB_EXPORT")
+endif()
+
+nanobind_add_module(test_lib_path_ext test_lib_path.cpp ${NB_EXTRA_ARGS})
+target_link_libraries(test_lib_path_ext PRIVATE test_lib_path_lib)
+
+nanobind_add_stub(
+    test_lib_path_ext_stub
+    MODULE test_lib_path_ext
+    OUTPUT test_lib_path_ext.pyi
+    PYTHON_PATH $<TARGET_FILE_DIR:test_lib_path_ext>
+    LIB_PATH $<TARGET_FILE_DIR:test_lib_path_lib>
+    DEPENDS test_lib_path_ext
 )

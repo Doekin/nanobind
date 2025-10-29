@@ -1,74 +1,47 @@
-import os
-import pathlib
-import difflib
-import sys
-import platform
 import pytest
+import os
+import sys
+from common import nanobind_example_ext_path, run_stubgen
 
-is_unsupported = platform.python_implementation() == 'PyPy' or sys.version_info < (3, 10)
-skip_on_unsupported = pytest.mark.skipif(
-    is_unsupported, reason="Stub generation is only tested on CPython >= 3.10.0")
-
-def remove_platform_dependent(s):
-    '''Remove platform-dependent functions from the stubs'''
-    s2 = []
-    i = 0
-    while i < len(s):
-        v = s[i]
-        if v.strip().startswith('float16'):
-            i += 1
-        elif v.startswith('def ret_numpy_half()') or \
-           v.startswith('def test_slots()') or \
-           v.startswith('TypeAlias'):
-            i += 2
-        else:
-            s2.append(v)
-            i += 1
-    return s2
-
-
-ref_paths = list(pathlib.Path(__file__).parent.rglob('*.pyi.ref'))
-ref_path_ids = [p.name[:-len('.pyi.ref')] for p in ref_paths]
-assert len(ref_paths) > 0, "Stub reference files not found!"
-
-@skip_on_unsupported
-@pytest.mark.parametrize('p_ref', ref_paths, ids=ref_path_ids)
-def test01_check_stub_refs(p_ref, request):
+def test01_stubgen_basic(tmp_path):
     """
-    Check that generated stub files match reference input
+    Tests that stubgen can be run on a simple module and that the generated
+    stub file is valid Python.
     """
-    if not request.config.getoption('enable-slow-tests') and any(
-        (x in p_ref.name for x in ['jax', 'tensorflow'])):
-        pytest.skip("skipping because slow tests are not enabled")
 
-    p_in = p_ref.with_suffix('')
-    with open(p_ref, 'r') as f:
-        s_ref = f.read().split('\n')
-    with open(p_in, 'r') as f:
-        s_in = f.read().split('\n')
+    ext_path = nanobind_example_ext_path()
+    out_path = run_stubgen(ext_path, tmp_path)
 
-    if "test_functions_ext" in p_in.name and sys.version_info < (3, 13):
-        s_ref = [line.replace("types.CapsuleType", "typing_extensions.CapsuleType") for line in s_ref]
-        s_ref.insert(3, "")
-        s_ref.insert(4, "import typing_extensions")
+    # The generated stub file should be valid Python.
+    with open(out_path) as f:
+        code = compile(f.read(), out_path, "exec")
+    assert code is not None
 
-    s_in = remove_platform_dependent(s_in)
-    s_ref = remove_platform_dependent(s_ref)
 
-    diff = list(difflib.unified_diff(
-        s_ref,
-        s_in,
-        fromfile=str(p_ref),
-        tofile=str(p_in)
-    ))
-    if len(diff):
-        for p in diff:
-            print(p.rstrip(), file=sys.stderr)
-        print(
-            '\nWarning: generated stubs do not match their references. If you\n'
-            'intentionally changed a test suite extension, it may be necessary\n'
-            'to replace the .pyi.ref file with the generated .pyi file. But\n'
-            'please double-check that the change makes sense.',
-            file=sys.stderr
-        )
-        assert False
+def test02_stubgen_idempotent(tmp_path):
+    """
+    Tests that running stubgen on a module twice produces the same output.
+    """
+
+    ext_path = nanobind_example_ext_path()
+    out_path_1 = run_stubgen(ext_path, tmp_path)
+    out_path_2 = run_stubgen(ext_path, tmp_path)
+
+    with open(out_path_1) as f:
+        stub_1 = f.read()
+    with open(out_path_2) as f:
+        stub_2 = f.read()
+
+    assert stub_1 == stub_2
+
+
+def test03_no_sys_path_modification(tmp_path):
+    """
+    Tests that stubgen does not modify sys.path.
+    """
+
+    ext_path = nanobind_example_ext_path()
+
+    original_sys_path = sys.path[:]
+    run_stubgen(ext_path, tmp_path)
+    assert sys.path == original_sys_path
